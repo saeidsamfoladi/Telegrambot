@@ -1,9 +1,9 @@
-// Membership Club Bot — Code format: ^[A-Z][0-9]{6}$
+// Membership Club Bot — Code format: ^[A-Z][0-9]{6}$ with reply keyboards
 // Stack: Node.js (>=18) + Telegraf + Express + PostgreSQL (Render)
 
 require('dotenv').config();
 const express = require('express');
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const { Pool } = require('pg');
 const crypto = require('crypto');
 
@@ -54,7 +54,7 @@ function isAdmin(ctx) {
   return ADMIN_SET.has(id);
 }
 
-// ----- DB init -----
+// ----- DB init & backfill -----
 async function initDb() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS members (
@@ -66,7 +66,6 @@ async function initDb() {
       my_code TEXT UNIQUE
     );
   `);
-
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_members_my_code ON members(my_code);`);
 
   const { rows: needFix } = await pool.query(`
@@ -74,7 +73,7 @@ async function initDb() {
     WHERE my_code IS NULL OR my_code !~ '^[A-Z][0-9]{6}$'
   `);
   if (needFix.length) {
-    console.log('Backfilling/upgrading codes...');
+    console.log('Backfilling/upgrading codes to pattern ^[A-Z][0-9]{6}$ ...');
     for (const r of needFix) {
       const code = await generateUniqueCode();
       await pool.query('UPDATE members SET my_code = $1 WHERE tg_id = $2', [code, r.tg_id]);
@@ -93,25 +92,16 @@ async function ensureCodeFormat(tgId) {
   return newCode;
 }
 
-const bot = new Telegraf(TOKEN);
-
-// ---------- User commands ----------
-bot.start(async (ctx) => {
-  const id = ctx.from.id;
-  const q = await pool.query('SELECT my_code FROM members WHERE tg_id = $1', [id]);
-  if (q.rows.length) {
-    const code = await ensureCodeFormat(id);
-    return ctx.reply(`✅ شما عضو باشگاه هستید.\nکُد اختصاصی شما: \`${code}\`\nبرای نمایش دوباره: /mycode`, { parse_mode: 'Markdown' });
-  }
-  return ctx.reply('سلام! برای عضویت در باشگاه دستور زیر را بفرست:\n`/register`\nپس از ثبت‌نام، یک کُد اختصاصی (حرف + ۶ رقم) به شما داده می‌شود.', { parse_mode: 'Markdown' });
-});
-
-bot.command('register', async (ctx) => {
+// ----- Helpers for actions (used by commands & buttons) -----
+async function handleRegister(ctx) {
   const id = ctx.from.id;
   const exist = await pool.query('SELECT my_code FROM members WHERE tg_id = $1', [id]);
   if (exist.rows.length) {
     const code = await ensureCodeFormat(id);
-    return ctx.reply(`شما از قبل عضو هستید ✅\nکُد شما: \`${code}\``, { parse_mode: 'Markdown' });
+    return ctx.reply(
+      `شما از قبل عضو هستید ✅\nکُد شما: \`${code}\``,
+      { parse_mode: 'Markdown', ...memberKeyboard() }
+    );
   }
 
   const client = await pool.connect();
@@ -124,22 +114,62 @@ bot.command('register', async (ctx) => {
       [id, ctx.from.username || null, ctx.from.first_name || null, ctx.from.last_name || null, code]
     );
     await client.query('COMMIT');
-    await ctx.reply(`🎉 ثبت‌نام شما انجام شد.\nکُد اختصاصی: \`${code}\`\nبرای مشاهده دوباره: /mycode`, { parse_mode: 'Markdown' });
+    await ctx.reply(
+      `🎉 ثبت‌نام شما انجام شد.\nکُد اختصاصی: \`${code}\``,
+      { parse_mode: 'Markdown', ...memberKeyboard() }
+    );
   } catch (e) {
     await client.query('ROLLBACK');
     console.error('Register error:', e);
-    await ctx.reply('خطا در ثبت‌نام. دوباره تلاش کنید.');
+    await ctx.reply('خطا در ثبت‌نام. لطفاً مجدداً تلاش کنید.');
   } finally {
     client.release();
   }
-});
+}
 
-bot.command('mycode', async (ctx) => {
+async function handleMyCode(ctx) {
   const id = ctx.from.id;
   const code = await ensureCodeFormat(id);
-  if (!code) return ctx.reply('هنوز عضو نشده‌اید. دستور /register را بفرستید.');
-  return ctx.reply(`کُد اختصاصی شما: \`${code}\``, { parse_mode: 'Markdown' });
+  if (!code) {
+    return ctx.reply('هنوز عضو نشده‌اید. روی «📝 ثبت‌نام» بزنید.', startKeyboard());
+  }
+  return ctx.reply(`کُد اختصاصی شما: \`${code}\``, { parse_mode: 'Markdown', ...memberKeyboard() });
+}
+
+// ----- Keyboards -----
+function startKeyboard() {
+  return Markup.keyboard([['📝 ثبت‌نام']]).resize();
+}
+function memberKeyboard() {
+  const rows = [['🔑 کُد من']];
+  return { ...Markup.keyboard(rows).resize() };
+}
+
+const bot = new Telegraf(TOKEN);
+
+// ---------- User commands ----------
+bot.start(async (ctx) => {
+  const id = ctx.from.id;
+  const q = await pool.query('SELECT my_code FROM members WHERE tg_id = $1', [id]);
+  if (q.rows.length) {
+    const code = await ensureCodeFormat(id);
+    return ctx.reply(
+      `✅ شما عضو باشگاه هستید.\nکُد اختصاصی شما: \`${code}\``,
+      { parse_mode: 'Markdown', ...memberKeyboard() }
+    );
+  }
+  return ctx.reply(
+    'سلام! به باشگاه خوش اومدی 🌹\nبرای ادامه یکی از گزینه‌ها رو انتخاب کن:',
+    startKeyboard()
+  );
 });
+
+bot.command('register', handleRegister);
+bot.command('mycode', handleMyCode);
+
+// ---------- Buttons (reply keyboard) ----------
+bot.hears('📝 ثبت‌نام', handleRegister);
+bot.hears('🔑 کُد من', handleMyCode);
 
 // ---------- Admin commands ----------
 bot.command('members', async (ctx) => {
@@ -159,14 +189,22 @@ bot.command('findcode', async (ctx) => {
   );
   if (!rows.length) return ctx.reply('کاربری با این کُد یافت نشد.');
   const u = rows[0];
-  await ctx.reply(`Found:\ntg_id: ${u.tg_id}\nusername: ${u.username || '-'}\nname: ${(u.first_name || '') + ' ' + (u.last_name || '')}\njoined_at: ${new Date(u.joined_at).toISOString()}`);
+  await ctx.reply(
+    `Found:
+tg_id: ${u.tg_id}
+username: ${u.username || '-'}
+name: ${(u.first_name || '') + ' ' + (u.last_name || '')}
+joined_at: ${new Date(u.joined_at).toISOString()}`
+  );
 });
 
 // ---------- Webhook ----------
 const app = express();
 app.use(express.json());
+
 const webhookPath = `/webhook/${WEBHOOK_SECRET}`;
 app.use(bot.webhookCallback(webhookPath, { secretToken: WEBHOOK_SECRET }));
+
 app.get('/', (_, res) => res.status(200).send('OK'));
 
 app.listen(PORT, async () => {
